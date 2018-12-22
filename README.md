@@ -1,2 +1,1 @@
-# uwezoblog_dfy
-Uwezo Blog for iBeads
+Wordpress for Uwezo blog for iBeads

@@ -1,0 +1,83 @@
+{
+	"name": "Uwezo Blog",
+	"id": "uwezoblog",
+	"packaging_format": 1,
+	"description": {
+		"en": "Create a beautiful blog or website easily",
+		"fr": "Logiciel de création de blog ou de site Web"
+	},
+	"version": "4.9.1~ynh1",
+	"url": "https://www.deifysolutions.com",
+	"license": "GPL-2.0",
+	"maintainer": {
+		"name": "Deify Infocomm Solutions",
+		"email": "support@deifysolutions.com"
+	},
+    "requirements": {
+        "yunohost": ">= 2.7.2"
+    },
+	"multi_instance": true,
+	"services": [
+		"nginx",
+		"php5-fpm",
+		"mysql"
+	],
+	"arguments": {
+		"install" : [
+			{
+				"name": "domain",
+				"type": "domain",
+				"ask": {
+					"en": "Choose a domain for Uwezo Blog",
+					"fr": "Choisissez un domaine pour WordPress"
+				},
+				"example": "domain.org"
+			},
+			{
+				"name": "path",
+				"type": "path",
+				"ask": {
+					"en": "Choose a path for Uwezo Blog",
+					"fr": "Choisissez un chemin pour WordPress"
+				},
+				"example": "/blog",
+				"default": "/blog"
+			},
+			{
+				"name": "admin",
+				"type": "user",
+				"ask": {
+					"en": "Choose the WordPress administrator (must be an existing iBeads user)"
+				},
+				"example": "john"
+			},
+			{
+				"name": "language",
+				"ask": {
+					"en": "Choose the language of the WordPress site",
+					"fr": "Choissisez la langue du WordPress"
+				},
+				"choices": ["en_US", "fr_FR"],
+				"default": "en_US"
+			},
+			{
+				"name": "multisite",
+				"type": "boolean",
+				"ask": {
+					"en": "Enable multisite option ?",
+					"fr": "Activer l'option multisite ?"
+				},
+				"default": false
+			},
+			{
+				"name": "is_public",
+				"type": "boolean",
+				"ask": {
+					"en": "Is it a public WordPress site ?",
+					"fr": "Est-ce un site public ?"
+				},
+				"default": true
+			}
+		]
+	}
+}

@@ -1,0 +1,265 @@
+#!/bin/bash
+
+#=================================================
+# GENERIC STARTING
+#=================================================
+# IMPORT GENERIC HELPERS
+#=================================================
+
+source _common.sh
+source /usr/share/yunohost/helpers
+
+#=================================================
+# MANAGE FAILURE OF THE SCRIPT
+#=================================================
+
+# Exit if an error occurs during the execution of the script
+ynh_abort_if_errors
+
+#=================================================
+# RETRIEVE ARGUMENTS FROM THE MANIFEST
+#=================================================
+
+domain=$YNH_APP_ARG_DOMAIN
+path_url=$YNH_APP_ARG_PATH
+admin_wordpress=$YNH_APP_ARG_ADMIN
+language=$YNH_APP_ARG_LANGUAGE
+multisite=$YNH_APP_ARG_MULTISITE
+is_public=$YNH_APP_ARG_IS_PUBLIC
+
+app=$YNH_APP_INSTANCE_NAME
+
+#=================================================
+# CHECK IF THE APP CAN BE INSTALLED WITH THIS ARGS
+#=================================================
+
+final_path=/var/www/$app
+test ! -e "$final_path" || ynh_die "This path already contains a folder"
+
+# Normalize the url path syntax
+path_url=$(ynh_normalize_url_path $path_url)
+
+# Check web path availability
+ynh_webpath_available $domain $path_url
+# Register (book) web path
+ynh_webpath_register $app $domain $path_url
+
+if [ "$path_url" == "/" ] && [ $multisite -eq 1 ]; then
+	ynh_die "Multisite option of wordpress doesn't work at root of domain."
+fi
+
+#=================================================
+# STORE SETTINGS FROM MANIFEST
+#=================================================
+
+ynh_app_setting_set $app domain $domain
+ynh_app_setting_set $app path $path_url
+ynh_app_setting_set $app admin $admin_wordpress
+ynh_app_setting_set $app is_public $is_public
+ynh_app_setting_set $app language $language
+ynh_app_setting_set $app multisite $multisite
+
+#=================================================
+# STANDARD MODIFICATIONS
+#=================================================
+# INSTALL DEPENDENCIES
+#=================================================
+
+ynh_install_app_dependencies php5-cli
+
+#=================================================
+# CREATE A SQL BDD
+#=================================================
+
+db_name=$(ynh_sanitize_dbid $app)
+ynh_app_setting_set $app db_name $db_name
+ynh_mysql_setup_db $db_name $db_name
+
+#=================================================
+# DOWNLOAD, CHECK AND UNPACK SOURCE
+#=================================================
+
+ynh_app_setting_set $app final_path $final_path
+# Download, check integrity, uncompress and patch the source from app.src
+ynh_setup_source "$final_path"
+
+#=================================================
+# NGINX CONFIGURATION
+#=================================================
+
+# Create a dedicated nginx config
+if [ "$path_url" != "/" ]
+then
+	ynh_replace_string "^#sub_path_only" "" "../conf/nginx.conf"
+fi
+ynh_add_nginx_config
+
+#=================================================
+# CREATE DEDICATED USER
+#=================================================
+
+# Create a system user
+ynh_system_user_create $app
+
+#=================================================
+# PHP-FPM CONFIGURATION
+#=================================================
+
+# Create a dedicated php-fpm config
+ynh_add_fpm_config
+
+#=================================================
+# SPECIFIC SETUP
+#=================================================
+# CONFIGURE WP-CONFIG
+#=================================================
+
+cp ../conf/wp-config.php $final_path/wp-config.php
+# Change variables in Wordpress configuration
+ynh_replace_string "__DB_USER__" "$db_name" $final_path/wp-config.php
+ynh_replace_string "__DB_PWD__" "$db_pwd" $final_path/wp-config.php
+
+for i in 1 2 3 4 5 6 7 8
+do
+	j=$(dd if=/dev/urandom bs=1 count=200 2> /dev/null | tr -c -d '[A-Za-z0-9]' | sed -n 's/\(.\{40\}\).*/\1/p')
+	if [ "$j" = "" ];
+	then
+		# For obscure reasons, the loop is too fast at execution
+		sleep 1
+		j=$(dd if=/dev/urandom bs=1 count=200 2> /dev/null | tr -c -d '[A-Za-z0-9]' | sed -n 's/\(.\{40\}\).*/\1/p')
+	fi
+	ynh_replace_string "KEY$i" "$j" $final_path/wp-config.php
+done
+
+#=================================================
+# SETTING UP WITH CURL
+#=================================================
+
+# Set right permissions for curl install
+chown -R $app: $final_path
+
+# Rend la page d'install publique pour curl
+ynh_app_setting_set $app unprotected_uris "/"
+yunohost app ssowatconf	# Régénère la configuration de SSOwat
+
+# Reload Nginx
+systemctl reload nginx
+
+# Wordpress installation
+ynh_local_curl "/wp-admin/install.php?step=2" "&weblog_title=YunoBlog" "user_name=$admin_wordpress" "admin_password=$db_pwd" "admin_password2=$db_pwd" "admin_email=$admin_wordpress@$domain" "Submit=Install+WordPress"
+
+WARNING echo -n "Please wait during Wordpress installation"
+for i in `seq 1 300`
+do	# La boucle attend la fin de l'installation de wordpress Ou 5 minutes.
+	if ynh_mysql_connect_as $db_name $db_pwd $db_name <<< "show tables" | grep -q "wp_options"; then
+		break	# Si la table wp_options est trouvée, l'installation de wordpress est terminée. Quitte la boucle.
+	fi
+	WARNING echo -n "."
+	sleep 1
+done
+WARNING echo ""
+
+#=================================================
+# INSTALL WORDPRESS' PLUGINS
+#=================================================
+
+wget -nv https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -O $final_path/wp-cli.phar
+wpcli_alias="php $final_path/wp-cli.phar --allow-root --path=$final_path"
+
+$wpcli_alias plugin install simple-ldap-login
+$wpcli_alias plugin install http-authentication
+$wpcli_alias plugin install companion-auto-update
+$wpcli_alias plugin install wp-fail2ban
+
+#=================================================
+# SET LANGUAGE
+#=================================================
+
+$wpcli_alias core language install $language
+$wpcli_alias core language activate $language
+
+#=================================================
+# CONFIGURE MULTISITE
+#=================================================
+
+if [ $multisite -eq 1 ]
+then
+	ynh_replace_string "#--MULTISITE--" "" /etc/nginx/conf.d/$domain.d/$app.conf
+	# Autorise le multisite wordpress
+	ynh_replace_string "//--MULTISITE1--define" "define " $final_path/wp-config.php
+
+	# Active le multisite via wp-cli.
+	ALL_QUIET $wpcli_alias core multisite-convert --base=$path_url/
+
+	# Active le multisite wordpress
+	ynh_replace_string "//--MULTISITE2--define" "define" $final_path/wp-config.php
+
+	ynh_mysql_connect_as $db_name $db_pwd $db_name < ../conf/sql/multisite.sql
+	plugin_network="--network"
+else
+	ynh_mysql_connect_as $db_name $db_pwd $db_name < ../conf/sql/single.sql
+	plugin_network=""
+fi
+
+#=================================================
+# ACTIVATE WORDPRESS' PLUGINS
+#=================================================
+
+$wpcli_alias plugin activate simple-ldap-login $plugin_network
+# Do not activate http-authentication, this plugin is sometimes unstable
+$wpcli_alias plugin activate companion-auto-update $plugin_network
+$wpcli_alias plugin activate wp-fail2ban $plugin_network
+
+#=================================================
+# STORE THE CHECKSUM OF THE CONFIG FILE
+#=================================================
+
+# Calculate and store the config file checksum into the app settings
+ynh_store_file_checksum "$final_path/wp-config.php"
+
+#=================================================
+# GENERIC FINALISATION
+#=================================================
+# SECURING FILES AND DIRECTORIES
+#=================================================
+
+# Les fichiers appartiennent à l'user wordpress, pour permettre les mises à jour.
+chown -R $app: $final_path
+# Sauf le fichier de config wp-config.php qui appartient à root
+chown root: $final_path/wp-config.php
+
+#=================================================
+# SETUP FAIL2BAN
+#=================================================
+
+ynh_add_fail2ban_config "/var/log/auth.log" "Authentication (attempt for unknown user|failure for) .* from <HOST>" 5
+
+#=================================================
+# SETUP SSOWAT
+#=================================================
+
+if [ $is_public -eq 0 ];
+then
+	# Retire l'accès public
+	ynh_app_setting_delete $app unprotected_uris
+fi
+
+#=================================================
+# RELOAD NGINX
+#=================================================
+
+systemctl reload nginx
+
+#=================================================
+# REMOVE WP-CLI.PHAR
+#=================================================
+
+ynh_secure_remove $final_path/wp-cli.phar
+
+#=================================================
+# SEND A README FOR THE ADMIN
+#=================================================
+
+message="If you facing an issue or want to improve this app, please open a new issue in this project: https://github.com/YunoHost-Apps/wordpress_ynh"
+
+ynh_send_readme_to_admin "$message" "$admin_wordpress"

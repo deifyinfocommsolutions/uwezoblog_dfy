@@ -1,0 +1,219 @@
+#!/bin/bash
+
+#=================================================
+# GENERIC STARTING
+#=================================================
+# IMPORT GENERIC HELPERS
+#=================================================
+
+source _common.sh
+source /usr/share/yunohost/helpers
+
+#=================================================
+# LOAD SETTINGS
+#=================================================
+
+app=$YNH_APP_INSTANCE_NAME
+
+domain=$(ynh_app_setting_get $app domain)
+path_url=$(ynh_app_setting_get $app path)
+admin_wordpress=$(ynh_app_setting_get $app admin)
+language=$(ynh_app_setting_get $app language)
+is_public=$(ynh_app_setting_get $app is_public)
+multisite=$(ynh_app_setting_get $app multisite)
+final_path=$(ynh_app_setting_get $app final_path)
+db_name=$(ynh_app_setting_get $app db_name)
+
+#=================================================
+# CHECK VERSION
+#=================================================
+
+ynh_abort_if_up_to_date
+
+#=================================================
+# ENSURE DOWNWARD COMPATIBILITY
+#=================================================
+
+if [ -z "$admin_wordpress" ]; then
+	ynh_mysql_execute_as_root "select MAX(user_login) from wp_users where user_status=0 INTO OUTFILE '/tmp/wordpressuser';" $db_name
+	admin_wordpress=$(cat /tmp/wordpressuser)
+	ynh_secure_remove /tmp/wordpressuser
+	ynh_app_setting_set $app admin $admin_wordpress
+fi
+
+if [ -z "$final_path" ]; then
+	final_path=/var/www/$app
+	ynh_app_setting_set $app final_path $final_path
+fi
+
+if [ -z "$language" ]; then
+	language=$(grep WPLANG $final_path/wp-config.php | cut -d"'" -f4)
+	ynh_app_setting_set $app language $language
+fi
+
+if [ "${is_public,,}" = "yes" ]; then
+	ynh_app_setting_set $app is_public 1	# Fixe is_public en booléen
+	is_public=1
+elif [ "${is_public,,}" = "no" ]; then
+	ynh_app_setting_set $app is_public 0
+	is_public=0
+fi
+
+if [ "${multisite,,}" = "yes" ]; then
+	ynh_app_setting_set $app multisite 1	# Fixe multisite en booléen
+	multisite=1
+elif [ "${multisite,,}" = "no" ]; then
+	ynh_app_setting_set $app multisite 0
+	multisite=0
+fi
+
+if [ -z $db_name ]; then	# Si db_name n'est pas renseigné dans app setting
+	db_name=$(ynh_sanitize_dbid $app)
+	ynh_app_setting_set $app db_name $db_name
+fi
+
+if grep add_filter.*auto_update $final_path/wp-config.php; then	# Si des add_filter demeurent dans le wp-config
+	sed --in-place '/add_filter.*auto_update/d' $final_path/wp-config.php
+fi
+
+#=================================================
+# STANDARD UPGRADE STEPS
+#=================================================
+# BACKUP BEFORE UPGRADE THEN ACTIVE TRAP
+#=================================================
+
+# Backup the current version of the app
+ynh_backup_before_upgrade
+ynh_clean_setup () {
+	# restore it if the upgrade fails
+	ynh_restore_upgradebackup
+}
+# Exit if an error occurs during the execution of the script
+ynh_abort_if_errors
+
+#=================================================
+# CHECK THE PATH
+#=================================================
+
+# Normalize the URL path syntax
+path_url=$(ynh_normalize_url_path $path_url)
+
+#=================================================
+# NGINX CONFIGURATION
+#=================================================
+
+# Create a dedicated nginx config
+if [ "$path_url" != "/" ]
+then
+	ynh_replace_string "^#sub_path_only" "" "../conf/nginx.conf"
+fi
+ynh_add_nginx_config
+
+#=================================================
+# CREATE DEDICATED USER
+#=================================================
+
+# Create the dedicated user, if not exist
+ynh_system_user_create $app
+
+#=================================================
+# PHP-FPM CONFIGURATION
+#=================================================
+
+# Create a dedicated php-fpm config
+ynh_add_fpm_config
+
+#=================================================
+# SPECIFIC UPGRADE
+#=================================================
+# SAVE THE CONFIG FILE IF IT BEEN MODIFIED
+#=================================================
+
+# Verify the checksum and backup the file if it's different
+ynh_backup_if_checksum_is_different "$final_path/wp-config.php"
+
+#=================================================
+# CONFIGURE MULTISITE
+#=================================================
+
+if [ $multisite -eq 1 ]
+then
+	ynh_replace_string "#--MULTISITE--" "" /etc/nginx/conf.d/$domain.d/$app.conf
+	plugin_network="--network"
+else
+	multisite=0
+	plugin_network=""
+	if [ $is_public -eq 0 ]
+	then
+		ynh_replace_string "#--PRIVATE--" "" /etc/nginx/conf.d/$domain.d/$app.conf
+	else
+		ynh_replace_string "//--PUBLIC--define" "define" $final_path/wp-config.php
+	fi
+fi
+ynh_app_setting_set $app multisite $multisite
+
+#=================================================
+# UPDATE WORDPRESS' PLUGINS
+#=================================================
+
+wget -nv https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -O $final_path/wp-cli.phar
+wpcli_alias="php $final_path/wp-cli.phar --allow-root --path=$final_path"
+update_plugin () {
+	( $wpcli_alias plugin is-installed $1 && $wpcli_alias plugin update $1 ) || $wpcli_alias plugin install $1
+}
+update_plugin simple-ldap-login
+$wpcli_alias plugin activate simple-ldap-login $plugin_network
+update_plugin companion-auto-update
+$wpcli_alias plugin activate companion-auto-update $plugin_network
+update_plugin wp-fail2ban
+$wpcli_alias plugin activate wp-fail2ban $plugin_network
+
+# Disable broken plugin http-authentication
+$wpcli_alias plugin is-installed http-authentication && $wpcli_alias plugin deactivate http-authentication $plugin_network
+
+#=================================================
+# STORE THE CHECKSUM OF THE CONFIG FILE
+#=================================================
+
+# Recalculate and store the config file checksum into the app settings
+ynh_store_file_checksum "$final_path/wp-config.php"
+
+#=================================================
+# GENERIC FINALISATION
+#=================================================
+# SECURING FILES AND DIRECTORIES
+#=================================================
+
+# Les fichiers appartiennent à l'user wordpress, pour permettre les mises à jour.
+chown -R $app: $final_path
+# Sauf le fichier de config wp-config.php qui appartient à root
+chown root: $final_path/wp-config.php
+
+#=================================================
+# UPGRADE FAIL2BAN
+#=================================================
+
+ynh_add_fail2ban_config "/var/log/auth.log" "Authentication (attempt for unknown user|failure for) .* from <HOST>" 5
+
+#=================================================
+# SETUP SSOWAT
+#=================================================
+
+ynh_app_setting_delete $app skipped_uris	# Retire le skipped_uris si il existe encore.
+if [ $is_public -eq 0 ]; then	# Retire l'accès public
+	ynh_app_setting_delete $app unprotected_uris
+else	# Ou remplace le skipped_uris par unprotected_uris le cas échéant.
+	ynh_app_setting_set $app unprotected_uris "/"
+fi
+
+#=================================================
+# RELOAD NGINX
+#=================================================
+
+systemctl reload nginx
+
+#=================================================
+# REMOVE WP-CLI.PHAR
+#=================================================
+
+ynh_secure_remove $final_path/wp-cli.phar
